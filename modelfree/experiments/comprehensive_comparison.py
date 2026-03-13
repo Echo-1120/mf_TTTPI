@@ -60,35 +60,36 @@ class ComprehensiveExperiment:
                     'ttpi': {
                         'class': ModelFreeTTPI,
                         'config': {
-                            'state_dims': [20, 20, 20, 20],
-                            'action_dims': [20, 2],
-                            'tt_ranks': [1, 4, 4, 4, 4, 4, 1],
+                            'state_dims': [8, 8, 8, 8],
+                            'action_dims': [8, 2],
+                            'tt_ranks': [1, 8, 8, 8, 8, 8, 1],
                             'gamma': 0.99,
-                            'lr': 0.0005,
-                            'buffer_size': 100000,
-                            'batch_size': 64,
-                            'target_update': 100,
-                            'epsilon_start': 1.0,
+                            'lr': 0.001,
+                            'buffer_size': 50000,
+                            'batch_size': 128,
+                            'target_update': 50,
+                            'epsilon_start': 10.0,
                             'epsilon_end': 0.01,
-                            'epsilon_decay': 5000,
-                            'augmentation_prob': 0.3,
-                            'init_scale': 0.01
+                            'epsilon_decay': 10000,
+                            'augmentation_prob': 0.2,
+                            'init_scale': 0.01,
+                            'candidates_per_state': 20 
                         }
                     },
                     'dqn': {
                         'class': DQNBaseline,
                         'config': {
                             'state_dim': 4,
-                            'action_dim': 20 * 2,  # 离散化后的总动作数
-                            'hidden_dim': 128,
-                            'lr': 0.0005,
-                            'buffer_size': 100000,
-                            'batch_size': 64,
+                            'action_dim': 8 * 2,  # 离散化后的总动作数
+                            'hidden_dim': 64,
+                            'lr': 0.001,
+                            'buffer_size': 50000,
+                            'batch_size': 128,
                             'gamma': 0.99,
-                            'target_update': 100,
+                            'target_update': 50,
                             'epsilon_start': 1.0,
                             'epsilon_end': 0.01,
-                            'epsilon_decay': 5000
+                            'epsilon_decay': 10000
                         }
                     },
                     'tabular': {
@@ -223,20 +224,32 @@ class ComprehensiveExperiment:
                     episode_length += 1
                     
                     if done:
-                        success_count += 1
+                        if info.get('success', False):
+                            success_count += 1
                         break
                 
                 episode_rewards.append(episode_reward)
                 episode_lengths.append(episode_length)
                 
                 # 定期输出
-                if (episode + 1) % 100 == 0:
+                if (episode + 1) % 50 == 0:
                     avg_reward = np.mean(episode_rewards[-100:])
                     success_rate = success_count / 100 if episode >= 99 else success_count / (episode + 1)
+                    # 获取更多调试信息
+                    last_reason = info.get('reason', 'N/A')
+                    last_distance = info.get('distance', 0) if 'distance' in info else 0
+
                     print(f"  Episode {episode+1}/{num_episodes}: "
                           f"平均奖励={avg_reward:.2f}, "
                           f"成功率={success_rate:.2%}, "
+                          f"最后原因={last_reason}, "
+                          f"最后距离={last_distance:.3f}, "
                           f"ϵ={getattr(agent, 'epsilon', 'N/A'):.3f}")
+                       # ⭐ 添加：如果连续多个episode奖励都极低，警告
+                if episode >= 99 and avg_reward < -200:
+                     recent_rewards = episode_rewards[-100:]
+                if np.mean(recent_rewards) < -300:
+                    print(f"  ⚠️ 警告：连续100个episode平均奖励<-300，可能需要调整参数")
                     success_count = 0
             
             # 记录本次运行结果
@@ -362,8 +375,8 @@ class ComprehensiveExperiment:
                 metrics = self.run_single_experiment(
                     env_name=env_name,
                     algorithm_name=algo_name,
-                    num_runs=3,  # 每个配置运行3次取平均
-                    num_episodes=1000,  # 1000轮充分训练
+                    num_runs=1,  # 每个配置运行3次取平均
+                    num_episodes=300,  # 1000轮充分训练
                     max_steps=200
                 )
                 env_results[algo_name] = metrics

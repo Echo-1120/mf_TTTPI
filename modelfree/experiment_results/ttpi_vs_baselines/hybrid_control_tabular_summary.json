@@ -1,0 +1,9 @@
+{
+  "environment": "hybrid_control",
+  "algorithm": "tabular",
+  "mean_final_performance": -175.00962197579716,
+  "std_final_performance": 0.0,
+  "mean_training_time": 16.219318628311157,
+  "mean_success_rate": 0.0,
+  "convergence_episode": 50.0
+}

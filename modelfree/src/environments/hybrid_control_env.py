@@ -146,107 +146,95 @@ class HybridControlEnv:
             self.state[:4] += noise[:4]
         
         # 4. 计算到目标的距离
+    
+        # 计算到目标的距离
         target_pos = self.target.cpu().numpy()
         current_pos = self.state[:2]
         distance = np.linalg.norm(current_pos - target_pos)
         
-        # 5. 记录进度（用于奖励塑形）
+        # 记录进度
         progress = 0.0
         if self.previous_distance is not None:
-            progress = self.previous_distance - distance  # 正数表示靠近目标
+            progress = self.previous_distance - distance  # 正数表示靠近
         
-        # 6. 更新步数计数
-        self.step_count += 1
-        
-        # 7. 判断episode结束条件和计算奖励
+        # 判断结束条件
         reward = 0.0
         done = False
         success = False
         reason = 'in_progress'
         
-        # 情况A：到达目标（真正成功）
+        # ==== 重构奖励函数 ====
+        # 1. 到达目标（真正成功）
         if distance < self.success_threshold:
             done = True
             success = True
             reason = 'reached_target'
-            # ⭐ 关键：大幅增加成功奖励，必须远大于撞墙惩罚
-            base_success_reward = 1000.0
-            reward = base_success_reward
+            reward = 500.0  # 基础成功奖励
             
-            # 额外奖励：快速完成更好
-            if hasattr(self, 'max_steps'):
-                steps_bonus = (self.max_steps - self.step_count) * 2.0
-                reward += max(steps_bonus, 0)
+            # 额外奖励：快速完成
+            steps_bonus = (self.max_steps - self.step_count) * 5.0
+            reward += max(steps_bonus, 0)
         
-        # 情况B：撞墙越界（失败）
+        # 2. 撞墙越界（明确失败）
         elif self._is_out_of_bounds(self.state[:2]):
             done = True
-            success = False  # ❌ 不是成功！
+            success = False  # ❌ 明确标记为失败
             reason = 'out_of_bounds'
-            # 撞墙惩罚（您已改为-500，这里设为-800以更明显区分）
-            reward = -800.0
-        
-        # 情况C：达到最大步数（超时失败）
-        elif hasattr(self, 'max_steps') and self.step_count >= self.max_steps:
+            reward = -100.0  # 惩罚但不致命
+            
+        # 3. 达到最大步数（超时失败）
+        elif self.step_count >= self.max_steps:
             done = True
             success = False
             reason = 'timeout'
-            # 超时惩罚：比撞墙轻，但鼓励快速完成
-            reward = -200.0
+            reward = -50.0  # 超时惩罚较轻
             
             # 如果接近目标，给部分奖励
             if distance < self.success_threshold * 2:
-                proximity_reward = 50.0 * (1 - distance/(self.success_threshold*2))
+                proximity_reward = 20.0 * (1 - distance/(self.success_threshold*2))
                 reward += proximity_reward
         
-        # 情况D：正常进行中
+        # 4. 正常进行中（奖励塑形）
         else:
             done = False
             success = False
             reason = 'in_progress'
             
-            # ⭐ 奖励塑形：复合奖励结构
-            # a) 基础距离惩罚（鼓励靠近目标）
-            distance_penalty = -distance * 0.5  # 系数减小，避免累积惩罚过大
+            # a) 基础距离惩罚（线性，不要太重）
+            distance_penalty = -distance * 0.2
             
-            # b) 进度奖励（最重要的塑形！鼓励向目标移动）
+            # b) 进度奖励（最重要的引导！）
             progress_reward = 0.0
             if progress > 0:  # 靠近目标
-                progress_reward = progress * 30.0  # 大幅奖励靠近行为
+                progress_reward = progress * 50.0  # 大幅奖励靠近
             elif progress < 0:  # 远离目标
                 progress_reward = progress * 10.0  # 适度惩罚远离
             
-            # c) 生存奖励（每步小奖励，鼓励探索）
-            survival_bonus = 0.1
+            # c) 生存奖励（鼓励继续探索）
+            survival_bonus = 0.5
             
             # d) 动作平滑惩罚（可选）
+            action_smooth_penalty = 0.0
             if self.previous_action is not None:
                 action_diff = np.linalg.norm(action_np - self.previous_action)
-                smooth_penalty = -action_diff * 0.05
-            else:
-                smooth_penalty = 0.0
+                action_smooth_penalty = -action_diff * 0.01
             
             # 总奖励
-            reward = (distance_penalty + progress_reward + 
-                     survival_bonus + smooth_penalty)
+            reward = distance_penalty + progress_reward + survival_bonus + action_smooth_penalty
         
-        # 8. 保存历史信息用于下一帧
+        # 保存历史信息
         self.previous_distance = distance
-        self.previous_action = action_np.copy()
         
-        # 9. 构建info字典
+        # 构建info字典（必须包含success字段！）
         info = {
             'success': success,
             'reason': reason,
             'distance': float(distance),
-            'step_count': self.step_count,
-            'position': self.state[:2].copy(),
-            'target': self.target.cpu().numpy()
+            'step_count': self.step_count
         }
         
-        # 10. 返回结果
-        next_state = torch.tensor(self.state, device=self.device)
         return next_state, float(reward), done, info
+
     
     def render(self, mode: str = 'human') -> Any:
         """

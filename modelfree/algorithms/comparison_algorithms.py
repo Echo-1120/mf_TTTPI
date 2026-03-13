@@ -63,7 +63,7 @@ class DQNBaseline:
                 q_values = self.q_network(state.unsqueeze(0))
                 return torch.argmax(q_values, dim=1)
     
-    def store_transition(self, state, action, reward, next_state, done):
+    def store_transition(self, state, action, reward, next_state, done, training=True):
         """存储经验"""
         self.replay_buffer.append((state, action, reward, next_state, done))
     
@@ -166,25 +166,28 @@ class TabularQLearning:
         else:
             return np.argmax(self.q_table[state_idx])
     
-    def store_transition(self, state, action, reward, next_state, done):
+
+    
+    def store_transition(self, state, action, reward, next_state, done, training=True):
         """存储并立即学习（表格法）"""
         state_idx = self.state_to_index(state)
         next_state_idx = self.state_to_index(next_state)
         
-        # Q学习更新
-        current_q = self.q_table[state_idx, action]
-        if done:
-            target_q = reward
-        else:
-            target_q = reward + self.gamma * np.max(self.q_table[next_state_idx])
-        
-        # 更新Q值
-        self.q_table[state_idx, action] = current_q + self.lr * (target_q - current_q)
-        
-        # 衰减探索率
+        # 只有训练模式下才更新Q表和探索率
         if training:
+            # Q学习更新
+            current_q = self.q_table[state_idx, action]
+            if done:
+                target_q = reward
+            else:
+                target_q = reward + self.gamma * np.max(self.q_table[next_state_idx])
+            
+            # 更新Q值
+            self.q_table[state_idx, action] = current_q + self.lr * (target_q - current_q)
+            
+            # 衰减探索率
             self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-    
+
     def train_step(self) -> Dict:
         """表格法没有单独的训练步骤"""
         return {'epsilon': self.epsilon}

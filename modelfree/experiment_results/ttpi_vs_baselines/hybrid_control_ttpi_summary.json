@@ -1,0 +1,9 @@
+{
+  "environment": "hybrid_control",
+  "algorithm": "ttpi",
+  "mean_final_performance": -112.51082598079739,
+  "std_final_performance": 0.0,
+  "mean_training_time": 585.5972640514374,
+  "mean_success_rate": 0.0,
+  "convergence_episode": 153.0
+}
