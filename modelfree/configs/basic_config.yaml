@@ -20,7 +20,7 @@ model:
   gamma: 0.99               # 折扣因子
   lr: 0.0005               # 学习率
   buffer_size: 100000      # 回放缓冲区大小
-  batch_size: 64           # 批次大小
+  batch_size: 512           # 批次大小
   target_update: 100       # 目标网络更新频率
   grad_clip: 10.0          # 梯度裁剪阈值
   weight_decay: 1e-5       # 权重衰减
@@ -38,7 +38,7 @@ model:
 
 training:
   seed: 42                 # 随机种子
-  total_episodes: 1000     # 总训练轮数
+  total_episodes: 300     # 总训练轮数
   max_steps_per_episode: 200  # 每轮最大步数
   log_interval: 50         # 日志记录间隔
   checkpoint_interval: 200 # 检查点保存间隔

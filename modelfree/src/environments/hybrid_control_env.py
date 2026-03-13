@@ -1,6 +1,7 @@
 """
 混合控制环境：Catch-Point问题
 包含连续和离散动作，适合测试TT算法
+修复版：解决自杀式局部最优问题
 """
 
 import torch
@@ -58,6 +59,13 @@ class HybridControlEnv:
         self.A = torch.eye(state_dim, device=device) * 0.9
         self.B = torch.randn(state_dim, action_dim, device=device) * 0.2
         
+        # 边界设置
+        self.bounds = [-1.0, 1.0, -1.0, 1.0]  # [x_min, x_max, y_min, y_max]
+        
+        # 初始化历史变量
+        self.previous_distance = None
+        self.previous_action = None
+        
         # 重置环境
         self.reset()
     
@@ -70,112 +78,175 @@ class HybridControlEnv:
         else:
             return torch.tensor(x, dtype=dtype, device=self.device)
     
-    def reset(self) -> torch.Tensor:
-        """
-        重置环境
+    def reset(self):
+        """重置环境"""
+        # 重置状态：初始位置在原点，速度为零
+        self.state = np.zeros(self.state_dim, dtype=np.float32)
+        if self.state_dim >= 2:
+            # 稍微随机化初始位置，避免总是在原点
+            self.state[0] = np.random.uniform(-0.2, 0.2)
+            self.state[1] = np.random.uniform(-0.2, 0.2)
         
-        Returns:
-            初始状态
-        """
-        # 初始状态：在原点附近随机初始化
-        self.state = torch.randn(self.state_dim, device=self.device) * 0.5
+        # 重置历史变量
+        self.previous_distance = None
+        self.previous_action = None
         self.step_count = 0
         
-        # 确保状态的前两个维度是位置
-        self.state[:2] = torch.rand(2, device=self.device) * 2 - 1  # 在[-1, 1]范围内
-        
-        return self.state.clone()
+        return torch.tensor(self.state, device=self.device)
     
-    def step(self, action) -> Tuple[torch.Tensor, float, bool, Dict[str, Any]]:
+    def _is_out_of_bounds(self, position):
+        """检查位置是否超出边界"""
+        x, y = position[0], position[1]
+        x_min, x_max, y_min, y_max = self.bounds
+        return (x < x_min or x > x_max or y < y_min or y > y_max)
+    
+    def step(self, action: torch.Tensor) -> Tuple[torch.Tensor, float, bool, Dict]:
         """
-        执行一步动作
+        执行一步动作 - 重构版奖励函数
         
-        Args:
-            action: 动作向量 [连续动作, 离散动作, ...]
-            
-        Returns:
-            next_state: 下一状态
-            reward: 奖励值
-            done: 是否终止
-            info: 附加信息
+        返回: (next_state, reward, done, info)
+        info包含:
+            - success: True表示真正成功到达目标，False表示失败
+            - reason: 结束原因 ('reached_target', 'out_of_bounds', 'timeout', 'in_progress')
+            - distance: 当前位置到目标的距离
         """
+        # 1. 确保动作是正确格式
+        if isinstance(action, torch.Tensor):
+            action_np = action.cpu().numpy()
+        else:
+            action_np = np.array(action)
+        
+        # 确保动作维度正确
+        if len(action_np) > self.action_dim:
+            action_np = action_np[:self.action_dim]
+        elif len(action_np) < self.action_dim:
+            action_np = np.pad(action_np, (0, self.action_dim - len(action_np)))
+        
+        # 2. 解析动作（假设是混合动作空间）
+        # 连续控制部分（方向）
+        theta = action_np[0] * np.pi  # 映射到[-π, π]
+        # 离散开关部分（如果有）
+        switch = int(action_np[1]) if len(action_np) > 1 else 0
+        
+        # 3. 更新状态（简化动力学）
+        dt = 0.1
+        speed = 0.05
+        
+        # 位置更新
+        self.state[0] += speed * np.cos(theta) * dt  # x
+        self.state[1] += speed * np.sin(theta) * dt  # y
+        
+        # 速度更新（简化的二阶系统）
+        self.state[2] = np.cos(theta) * speed  # vx
+        self.state[3] = np.sin(theta) * speed  # vy
+        
+        # 添加噪声
+        if hasattr(self, 'noise_scale') and self.noise_scale > 0:
+            noise = np.random.randn(4) * self.noise_scale
+            self.state[:4] += noise[:4]
+        
+        # 4. 计算到目标的距离
+        target_pos = self.target.cpu().numpy()
+        current_pos = self.state[:2]
+        distance = np.linalg.norm(current_pos - target_pos)
+        
+        # 5. 记录进度（用于奖励塑形）
+        progress = 0.0
+        if self.previous_distance is not None:
+            progress = self.previous_distance - distance  # 正数表示靠近目标
+        
+        # 6. 更新步数计数
         self.step_count += 1
         
-        # 确保动作是张量
-        action_tensor = self._ensure_tensor(action)
-        
-        # 提取动作分量
-        continuous_action = action_tensor[0]  # 方向控制
-        discrete_action = action_tensor[1]    # 移动开关
-        
-        # 动力学更新
-        if discrete_action > 0.5:  # 开关打开，允许移动
-            # 方向控制转换为速度
-            velocity = torch.stack([
-                torch.cos(continuous_action * torch.pi),
-                torch.sin(continuous_action * torch.pi)
-            ]) * 0.2
-            
-            # 更新位置
-            self.state[:2] = self.state[:2] + velocity
-            
-            # 更新速度（位置的差分）
-            if self.state_dim >= 4:
-                self.state[2:4] = velocity
-        
-        # 添加系统噪声
-        noise = torch.randn(self.state_dim, device=self.device) * self.noise_scale
-        self.state = self.state + noise
-        
-        # 边界约束
-        self.state = torch.clamp(self.state, -1.0, 1.0)
-        
-        # 计算奖励
-        position = self.state[:2]
-        distance = torch.norm(position - self.target)
-        
-        # 奖励组成：
-        # 1. 距离惩罚（负的欧氏距离）
-        distance_penalty = -distance * 5.0
-        
-        # 2. 动作惩罚（鼓励小动作）
-        action_penalty = -torch.sum(action_tensor ** 2) * 0.05
-        
-        # 3. 离散动作惩罚（鼓励节能）
-        if discrete_action > 0.5:
-            discrete_penalty = -0.1
-        else:
-            discrete_penalty = 0.0
-        
-        reward = distance_penalty + action_penalty + discrete_penalty
-        
-        # 检查终止条件
+        # 7. 判断episode结束条件和计算奖励
+        reward = 0.0
         done = False
+        success = False
+        reason = 'in_progress'
+        
+        # 情况A：到达目标（真正成功）
+        if distance < self.success_threshold:
+            done = True
+            success = True
+            reason = 'reached_target'
+            # ⭐ 关键：大幅增加成功奖励，必须远大于撞墙惩罚
+            base_success_reward = 1000.0
+            reward = base_success_reward
+            
+            # 额外奖励：快速完成更好
+            if hasattr(self, 'max_steps'):
+                steps_bonus = (self.max_steps - self.step_count) * 2.0
+                reward += max(steps_bonus, 0)
+        
+        # 情况B：撞墙越界（失败）
+        elif self._is_out_of_bounds(self.state[:2]):
+            done = True
+            success = False  # ❌ 不是成功！
+            reason = 'out_of_bounds'
+            # 撞墙惩罚（您已改为-500，这里设为-800以更明显区分）
+            reward = -800.0
+        
+        # 情况C：达到最大步数（超时失败）
+        elif hasattr(self, 'max_steps') and self.step_count >= self.max_steps:
+            done = True
+            success = False
+            reason = 'timeout'
+            # 超时惩罚：比撞墙轻，但鼓励快速完成
+            reward = -200.0
+            
+            # 如果接近目标，给部分奖励
+            if distance < self.success_threshold * 2:
+                proximity_reward = 50.0 * (1 - distance/(self.success_threshold*2))
+                reward += proximity_reward
+        
+        # 情况D：正常进行中
+        else:
+            done = False
+            success = False
+            reason = 'in_progress'
+            
+            # ⭐ 奖励塑形：复合奖励结构
+            # a) 基础距离惩罚（鼓励靠近目标）
+            distance_penalty = -distance * 0.5  # 系数减小，避免累积惩罚过大
+            
+            # b) 进度奖励（最重要的塑形！鼓励向目标移动）
+            progress_reward = 0.0
+            if progress > 0:  # 靠近目标
+                progress_reward = progress * 30.0  # 大幅奖励靠近行为
+            elif progress < 0:  # 远离目标
+                progress_reward = progress * 10.0  # 适度惩罚远离
+            
+            # c) 生存奖励（每步小奖励，鼓励探索）
+            survival_bonus = 0.1
+            
+            # d) 动作平滑惩罚（可选）
+            if self.previous_action is not None:
+                action_diff = np.linalg.norm(action_np - self.previous_action)
+                smooth_penalty = -action_diff * 0.05
+            else:
+                smooth_penalty = 0.0
+            
+            # 总奖励
+            reward = (distance_penalty + progress_reward + 
+                     survival_bonus + smooth_penalty)
+        
+        # 8. 保存历史信息用于下一帧
+        self.previous_distance = distance
+        self.previous_action = action_np.copy()
+        
+        # 9. 构建info字典
         info = {
-            'step': self.step_count,
-            'distance': distance.item(),
-            'position': position.cpu().numpy(),
+            'success': success,
+            'reason': reason,
+            'distance': float(distance),
+            'step_count': self.step_count,
+            'position': self.state[:2].copy(),
             'target': self.target.cpu().numpy()
         }
         
-        # 成功到达目标
-        if distance < self.success_threshold:
-            done = True
-            info['termination'] = 'success'
-            reward += 10.0  # 成功奖励
-        
-        # 步数限制
-        elif self.step_count >= self.max_steps:
-            done = True
-            info['termination'] = 'max_steps'
-        
-        # 状态越界（安全检查）
-        if torch.any(torch.abs(self.state) > 1.5):
-            done = True
-            info['termination'] = 'out_of_bounds'
-            reward -= 5.0
-        
-        return self.state.clone(), reward.item(), done, info
+        # 10. 返回结果
+        next_state = torch.tensor(self.state, device=self.device)
+        return next_state, float(reward), done, info
     
     def render(self, mode: str = 'human') -> Any:
         """
@@ -188,7 +259,7 @@ class HybridControlEnv:
             渲染结果
         """
         if mode == 'human':
-            position = self.state[:2].cpu().numpy()
+            position = self.state[:2]
             target = self.target.cpu().numpy()
             distance = np.linalg.norm(position - target)
             
@@ -196,13 +267,13 @@ class HybridControlEnv:
             print(f"Position: [{position[0]:.3f}, {position[1]:.3f}]")
             print(f"Target: [{target[0]:.3f}, {target[1]:.3f}]")
             print(f"Distance: {distance:.3f}")
-            print(f"State: {self.state.cpu().numpy()}")
+            print(f"State: {self.state}")
             print("-" * 40)
             
             return None
         elif mode == 'ansi':
             # 简单的文本渲染
-            position = self.state[:2].cpu().numpy()
+            position = self.state[:2]
             target = self.target.cpu().numpy()
             
             grid_size = 10

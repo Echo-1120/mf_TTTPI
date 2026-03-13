@@ -1,0 +1,244 @@
+"""
+混合控制环境：Catch-Point问题
+包含连续和离散动作，适合测试TT算法
+"""
+
+import torch
+import numpy as np
+from typing import Tuple, Dict, Any
+import warnings
+
+class HybridControlEnv:
+    """
+    混合控制环境示例：Catch-Point问题
+    状态: [位置x, 位置y, 速度x, 速度y]
+    动作: [连续方向控制, 离散开关控制]
+    """
+    
+    def __init__(self, state_dim: int = 4, action_dim: int = 2, 
+                 target_position: list = [0.5, 0.5], max_steps: int = 200,
+                 difficulty: str = 'medium', device: torch.device = torch.device('cpu')):
+        """
+        初始化混合控制环境
+        
+        Args:
+            state_dim: 状态维度
+            action_dim: 动作维度
+            target_position: 目标位置 [x, y]
+            max_steps: 最大步数
+            difficulty: 难度级别 ['easy', 'medium', 'hard']
+            device: 计算设备
+        """
+        assert state_dim >= 2, "状态维度至少为2"
+        assert action_dim >= 2, "动作维度至少为2"
+        
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.device = device
+        
+        # 目标位置
+        self.target = torch.tensor(target_position, device=device)
+        
+        # 难度配置
+        self.difficulty = difficulty
+        if difficulty == 'easy':
+            self.max_steps = max_steps // 2
+            self.noise_scale = 0.01
+            self.success_threshold = 0.2
+        elif difficulty == 'hard':
+            self.max_steps = max_steps * 2
+            self.noise_scale = 0.1
+            self.success_threshold = 0.05
+        else:  # medium
+            self.max_steps = max_steps
+            self.noise_scale = 0.05
+            self.success_threshold = 0.1
+        
+        # 系统矩阵（简单线性动力学）
+        self.A = torch.eye(state_dim, device=device) * 0.9
+        self.B = torch.randn(state_dim, action_dim, device=device) * 0.2
+        
+        # 重置环境
+        self.reset()
+    
+    def _ensure_tensor(self, x, dtype=torch.float32):
+        """确保输入是张量"""
+        if isinstance(x, np.ndarray):
+            return torch.tensor(x, dtype=dtype, device=self.device)
+        elif torch.is_tensor(x):
+            return x.to(self.device)
+        else:
+            return torch.tensor(x, dtype=dtype, device=self.device)
+    
+    def reset(self) -> torch.Tensor:
+        """
+        重置环境
+        
+        Returns:
+            初始状态
+        """
+        # 初始状态：在原点附近随机初始化
+        self.state = torch.randn(self.state_dim, device=self.device) * 0.5
+        self.step_count = 0
+        
+        # 确保状态的前两个维度是位置
+        self.state[:2] = torch.rand(2, device=self.device) * 2 - 1  # 在[-1, 1]范围内
+        
+        return self.state.clone()
+    
+    def step(self, action) -> Tuple[torch.Tensor, float, bool, Dict[str, Any]]:
+        """
+        执行一步动作
+        
+        Args:
+            action: 动作向量 [连续动作, 离散动作, ...]
+            
+        Returns:
+            next_state: 下一状态
+            reward: 奖励值
+            done: 是否终止
+            info: 附加信息
+        """
+        self.step_count += 1
+        
+        # 确保动作是张量
+        action_tensor = self._ensure_tensor(action)
+        
+        # 提取动作分量
+        continuous_action = action_tensor[0]  # 方向控制
+        discrete_action = action_tensor[1]    # 移动开关
+        
+        # 动力学更新
+        if discrete_action > 0.5:  # 开关打开，允许移动
+            # 方向控制转换为速度
+            velocity = torch.stack([
+                torch.cos(continuous_action * torch.pi),
+                torch.sin(continuous_action * torch.pi)
+            ]) * 0.2
+            
+            # 更新位置
+            self.state[:2] = self.state[:2] + velocity
+            
+            # 更新速度（位置的差分）
+            if self.state_dim >= 4:
+                self.state[2:4] = velocity
+        
+        # 添加系统噪声
+        noise = torch.randn(self.state_dim, device=self.device) * self.noise_scale
+        self.state = self.state + noise
+        
+        # 边界约束
+        self.state = torch.clamp(self.state, -1.0, 1.0)
+        
+        # 计算奖励
+        position = self.state[:2]
+        distance = torch.norm(position - self.target)
+        
+        # 奖励组成：
+        # 1. 距离惩罚（负的欧氏距离）
+        distance_penalty = -distance * 5.0
+        
+        # 2. 动作惩罚（鼓励小动作）
+        action_penalty = -torch.sum(action_tensor ** 2) * 0.05
+        
+        # 3. 离散动作惩罚（鼓励节能）
+        if discrete_action > 0.5:
+            discrete_penalty = -0.1
+        else:
+            discrete_penalty = 0.0
+        
+        reward = distance_penalty + action_penalty + discrete_penalty
+        
+        # 检查终止条件
+        done = False
+        info = {
+            'step': self.step_count,
+            'distance': distance.item(),
+            'position': position.cpu().numpy(),
+            'target': self.target.cpu().numpy()
+        }
+        
+        # 成功到达目标
+        if distance < self.success_threshold:
+            done = True
+            info['termination'] = 'success'
+            reward += 10.0  # 成功奖励
+        
+        # 步数限制
+        elif self.step_count >= self.max_steps:
+            done = True
+            info['termination'] = 'max_steps'
+        
+        # 状态越界（安全检查）
+        if torch.any(torch.abs(self.state) > 1.5):
+            done = True
+            info['termination'] = 'out_of_bounds'
+            reward -= 500.0
+        
+        return self.state.clone(), reward.item(), done, info
+    
+    def render(self, mode: str = 'human') -> Any:
+        """
+        渲染环境状态
+        
+        Args:
+            mode: 渲染模式 ('human', 'rgb_array', 'ansi')
+            
+        Returns:
+            渲染结果
+        """
+        if mode == 'human':
+            position = self.state[:2].cpu().numpy()
+            target = self.target.cpu().numpy()
+            distance = np.linalg.norm(position - target)
+            
+            print(f"Step: {self.step_count}")
+            print(f"Position: [{position[0]:.3f}, {position[1]:.3f}]")
+            print(f"Target: [{target[0]:.3f}, {target[1]:.3f}]")
+            print(f"Distance: {distance:.3f}")
+            print(f"State: {self.state.cpu().numpy()}")
+            print("-" * 40)
+            
+            return None
+        elif mode == 'ansi':
+            # 简单的文本渲染
+            position = self.state[:2].cpu().numpy()
+            target = self.target.cpu().numpy()
+            
+            grid_size = 10
+            grid = [['·' for _ in range(grid_size)] for _ in range(grid_size)]
+            
+            # 映射位置到网格
+            pos_x = int((position[0] + 1) / 2 * (grid_size - 1))
+            pos_y = int((position[1] + 1) / 2 * (grid_size - 1))
+            tar_x = int((target[0] + 1) / 2 * (grid_size - 1))
+            tar_y = int((target[1] + 1) / 2 * (grid_size - 1))
+            
+            # 设置网格字符
+            grid[grid_size - 1 - pos_y][pos_x] = 'A'  # Agent
+            grid[grid_size - 1 - tar_y][tar_x] = 'T'  # Target
+            
+            # 生成字符串
+            lines = []
+            for row in grid:
+                lines.append(' '.join(row))
+            
+            return '\n'.join(lines)
+        else:
+            raise ValueError(f"不支持的渲染模式: {mode}")
+    
+    def get_state_bounds(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """获取状态边界"""
+        low = torch.ones(self.state_dim, device=self.device) * -1.0
+        high = torch.ones(self.state_dim, device=self.device) * 1.0
+        return low, high
+    
+    def get_action_bounds(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """获取动作边界"""
+        low = torch.tensor([-1.0, 0.0], device=self.device)
+        high = torch.tensor([1.0, 1.0], device=self.device)
+        return low, high
+    
+    def close(self):
+        """关闭环境"""
+        pass

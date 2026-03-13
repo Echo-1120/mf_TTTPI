@@ -245,35 +245,31 @@ class ModelFreeTTPI:
     
     def _select_best_action(self, state_indices: torch.Tensor) -> torch.Tensor:
         """
-        选择最优动作（批处理版本）
-        
-        Args:
-            state_indices: 状态索引 [batch_size, state_dim]
-            
-        Returns:
-            最优动作索引 [batch_size, action_dim]
+        选择最优动作（批处理版本） - 高效矩阵化版本
         """
         batch_size = state_indices.shape[0]
-        best_actions = torch.zeros(batch_size, len(self.action_dims), 
-                                  dtype=torch.long, device=self.device)
-        
-        # 使用缓存的候选动作
         n_candidates = min(100, len(self._action_candidates))
         
-        for i in range(batch_size):
-            state_idx = state_indices[i:i+1].repeat(n_candidates, 1)
-            action_candidates = self._action_candidates[:n_candidates]
+        if n_candidates == 0:
+            return torch.zeros(batch_size, len(self.action_dims), dtype=torch.long, device=self.device)
             
-            # 构建状态-动作索引
-            sa_indices = torch.cat([state_idx, action_candidates], dim=1)
+        action_candidates = self._action_candidates[:n_candidates]
+        
+        # ==== 核心优化：并行评估所有动作候选 ====
+        # [B, S] -> [B*C, S]
+        states_repeated = state_indices.unsqueeze(1).repeat(1, n_candidates, 1).view(batch_size * n_candidates, -1)
+        # [C, A] -> [B*C, A]
+        actions_repeated = action_candidates.unsqueeze(0).repeat(batch_size, 1, 1).view(batch_size * n_candidates, -1)
+        
+        sa_indices = torch.cat([states_repeated, actions_repeated], dim=1)
+        
+        # 一次性计算出该批次下所有候选动作的 Q 值
+        with torch.no_grad():
+            q_values = self.q_network(sa_indices).view(batch_size, n_candidates)
             
-            # 评估Q值
-            with torch.no_grad():
-                q_values = self.q_network(sa_indices)
-            
-            # 选择最优动作
-            best_idx = torch.argmax(q_values)
-            best_actions[i] = action_candidates[best_idx]
+        # 直接通过矩阵的 argmax 找出每行的最优动作
+        best_indices = torch.argmax(q_values, dim=1)
+        best_actions = action_candidates[best_indices]
         
         return best_actions
     
@@ -298,13 +294,7 @@ class ModelFreeTTPI:
     
     def compute_td_error(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        计算TD误差（双Q学习）
-        
-        Args:
-            batch: 批次数据
-            
-        Returns:
-            TD误差 [batch_size]
+        计算TD误差（双Q学习） - 高效矩阵化版本
         """
         # 当前Q值
         sa_indices = torch.cat([batch['states'], batch['actions']], dim=1)
@@ -312,34 +302,34 @@ class ModelFreeTTPI:
         
         with torch.no_grad():
             next_state_indices = batch['next_states']
+            batch_size = next_state_indices.shape[0]
+            n_candidates = min(50, len(self._action_candidates))
             
-            # 双Q学习：使用在线网络选择动作，目标网络评估
-            best_next_q = torch.zeros(len(next_state_indices), device=self.device)
-            
-            for i in range(len(next_state_indices)):
-                state_idx = next_state_indices[i:i+1]
+            if n_candidates == 0:
+                best_next_q = torch.zeros(batch_size, device=self.device)
+            else:
+                action_candidates = self._action_candidates[:n_candidates]
                 
-                # 使用在线网络选择动作
-                best_q = -float('inf')
-                best_action_idx = None
+                # ==== 核心优化：完全向量化并行计算 ====
+                # 1. 扩展状态: [B, S] -> [B, 1, S] -> [B, C, S] -> [B*C, S]
+                states_repeated = next_state_indices.unsqueeze(1).repeat(1, n_candidates, 1).view(batch_size * n_candidates, -1)
                 
-                # 评估候选动作
-                n_candidates = min(50, len(self._action_candidates))
-                for j in range(n_candidates):
-                    action_idx = self._action_candidates[j:j+1]
-                    sa_idx = torch.cat([state_idx, action_idx], dim=1)
-                    q_value = self.q_network(sa_idx).item()
-                    
-                    if q_value > best_q:
-                        best_q = q_value
-                        best_action_idx = action_idx
+                # 2. 扩展动作: [C, A] -> [1, C, A] -> [B, C, A] -> [B*C, A]
+                actions_repeated = action_candidates.unsqueeze(0).repeat(batch_size, 1, 1).view(batch_size * n_candidates, -1)
                 
-                # 使用目标网络评估选择的动作
-                if best_action_idx is not None:
-                    sa_idx = torch.cat([state_idx, best_action_idx], dim=1)
-                    best_next_q[i] = self.target_network(sa_idx).item()
-                else:
-                    best_next_q[i] = 0.0
+                # 3. 拼接在一起: [B*C, Total_dims]
+                sa_idx_all = torch.cat([states_repeated, actions_repeated], dim=1)
+                
+                # 4. 一次性通过网络计算所有批次和候选动作的 Q 值！(从 3000 次耗时调用变为 1 次)
+                all_q_values = self.q_network(sa_idx_all).view(batch_size, n_candidates)
+                
+                # 5. 找出每个样本最优动作的索引
+                best_action_indices = torch.argmax(all_q_values, dim=1) # [B]
+                best_actions = action_candidates[best_action_indices]   # [B, A]
+                
+                # 6. 使用目标网络评估这些最优动作
+                sa_idx_target = torch.cat([next_state_indices, best_actions], dim=1)
+                best_next_q = self.target_network(sa_idx_target)
             
             # 计算目标Q值
             rewards = batch['rewards']

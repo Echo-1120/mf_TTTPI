@@ -1,0 +1,9 @@
+{
+  "environment": "hybrid_control",
+  "algorithm": "dqn",
+  "mean_final_performance": 65.43621383530154,
+  "std_final_performance": 60.17226771056363,
+  "mean_training_time": 591.8643883069357,
+  "mean_success_rate": 0.0,
+  "convergence_episode": 293.0
+}

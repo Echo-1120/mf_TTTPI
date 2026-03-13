@@ -154,8 +154,11 @@ class StableTTLayer(nn.Module):
         batch_size = indices.shape[0]
         
         # 确保索引在合法范围内
+        # max_vals = torch.tensor(self.dims, device=indices.device, dtype=indices.dtype) - 1
+        # indices = torch.clamp(indices, min=0, max=max_vals)
         max_vals = torch.tensor(self.dims, device=indices.device, dtype=indices.dtype) - 1
-        indices = torch.clamp(indices, min=0, max=max_vals)
+        min_val = torch.tensor(0, device=indices.device, dtype=indices.dtype)
+        indices = torch.clamp(indices, min_val, max_vals)
         
         
         # 逐步计算TT连乘，添加数值稳定性保护
